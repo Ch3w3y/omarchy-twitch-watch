@@ -9,9 +9,38 @@ set -euo pipefail
 
 CONFIG_FILE="$HOME/.config/twitch-watch/config.json"
 API="https://api.twitch.tv/helix"
+# Deadline and response-size ceiling applied to every Twitch API call below,
+# so a hung connection or a runaway/misbehaving response can't block or
+# balloon this script indefinitely.
+CURL_LIMITS=(--max-time 10 --max-filesize 5242880)
+# Hard cap on /channels/followed pages (100 channels/page). Comfortably above
+# any real follow list, but bounds memory growth if the API ever hands back
+# an endless cursor.
+MAX_FOLLOWED_PAGES=50
+
+# Refuses a symlink, a file owned by someone else, or anything implausibly
+# large, before ever handing $CONFIG_FILE to jq.
+config_file_ok() {
+  [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || return 1
+  [[ "$(stat -c %u -- "$CONFIG_FILE" 2>/dev/null)" == "$(id -u)" ]] || return 1
+  local size
+  size="$(stat -c %s -- "$CONFIG_FILE" 2>/dev/null)" || return 1
+  (( size <= 65536 ))
+}
 
 client_id() {
-  jq -r '.client_id' "$CONFIG_FILE"
+  config_file_ok && jq -r '.client_id' "$CONFIG_FILE"
+}
+
+# Issues a curl request with the bearer token/client id fed through -K -
+# (stdin config) rather than an argv -H flag, so the token never appears in
+# `ps`/`/proc/<pid>/cmdline` for other local users to read.
+auth_curl() {
+  local token="$1" cid="$2"; shift 2
+  curl "$@" -K - <<EOF
+header = "Authorization: Bearer ${token}"
+header = "Client-Id: ${cid}"
+EOF
 }
 
 # GET $1 (path+query), returns body on stdout, retries once on 401.
@@ -19,12 +48,12 @@ api_get() {
   local path="$1" cid token raw status body
   cid="$(client_id)"
   token="$(twitch-auth token)"
-  raw="$(curl -s -w $'\n%{http_code}' "$API$path" -H "Authorization: Bearer $token" -H "Client-Id: $cid")"
+  raw="$(auth_curl "$token" "$cid" "${CURL_LIMITS[@]}" -s -w $'\n%{http_code}' "$API$path")"
   status="${raw##*$'\n'}"
   body="${raw%$'\n'*}"
   if [[ "$status" == "401" ]]; then
     token="$(twitch-auth token --force-refresh)"
-    raw="$(curl -s -w $'\n%{http_code}' "$API$path" -H "Authorization: Bearer $token" -H "Client-Id: $cid")"
+    raw="$(auth_curl "$token" "$cid" "${CURL_LIMITS[@]}" -s -w $'\n%{http_code}' "$API$path")"
     status="${raw##*$'\n'}"
     body="${raw%$'\n'*}"
   fi
@@ -37,17 +66,14 @@ api_get() {
 
 # Prints "true"/"false" for whether $user_id subscribes to $broadcaster_id.
 check_sub() {
-  local broadcaster_id="$1" user_id="$2" cid token status
+  local broadcaster_id="$1" user_id="$2" cid token status path
   cid="$(client_id)"
   token="$(twitch-auth token)"
-  status="$(curl -s -o /dev/null -w '%{http_code}' \
-    "$API/subscriptions/user?broadcaster_id=$broadcaster_id&user_id=$user_id" \
-    -H "Authorization: Bearer $token" -H "Client-Id: $cid")"
+  path="/subscriptions/user?broadcaster_id=$broadcaster_id&user_id=$user_id"
+  status="$(auth_curl "$token" "$cid" "${CURL_LIMITS[@]}" -s -o /dev/null -w '%{http_code}' "$API$path")"
   if [[ "$status" == "401" ]]; then
     token="$(twitch-auth token --force-refresh)"
-    status="$(curl -s -o /dev/null -w '%{http_code}' \
-      "$API/subscriptions/user?broadcaster_id=$broadcaster_id&user_id=$user_id" \
-      -H "Authorization: Bearer $token" -H "Client-Id: $cid")"
+    status="$(auth_curl "$token" "$cid" "${CURL_LIMITS[@]}" -s -o /dev/null -w '%{http_code}' "$API$path")"
   fi
   [[ "$status" == "200" ]] && echo true || echo false
 }
@@ -75,9 +101,10 @@ menu_lines="false"
 
 user_id="$(twitch-auth whoami | jq -r '.user_id')"
 
-# 1. All followed channels, paginated.
+# 1. All followed channels, paginated (capped at MAX_FOLLOWED_PAGES).
 followed_json="[]"
 cursor=""
+page_count=0
 while :; do
   q="/channels/followed?user_id=$user_id&first=100"
   [[ -n "$cursor" ]] && q="$q&after=$cursor"
@@ -85,7 +112,12 @@ while :; do
   page="$(jq -c '.data' <<<"$resp")"
   followed_json="$(jq -c -n --argjson a "$followed_json" --argjson b "$page" '$a + $b')"
   cursor="$(jq -r '.pagination.cursor // empty' <<<"$resp")"
+  page_count=$((page_count + 1))
   [[ -z "$cursor" ]] && break
+  if (( page_count >= MAX_FOLLOWED_PAGES )); then
+    echo "twitch-followed-live: stopped after $MAX_FOLLOWED_PAGES pages of followed channels" >&2
+    break
+  fi
 done
 
 if [[ "$(jq 'length' <<<"$followed_json")" -eq 0 ]]; then
@@ -127,6 +159,9 @@ while IFS= read -r stream; do
   is_sub="$(check_sub "$bid" "$user_id")"
   thumbnail_url="$(jq -r '.thumbnail_url' <<<"$stream")"
   thumbnail_url="${thumbnail_url/\{width\}x\{height\}/220x124}"
+  # Only ever hand the QML Image an HTTPS URL on Twitch's own CDN host --
+  # never render whatever a stream's API response happened to put here.
+  [[ "$thumbnail_url" =~ ^https://static-cdn\.jtvnw\.net/ ]] || thumbnail_url=""
 
   entry="$(jq -c -n \
     --arg login "$login" --arg display_name "$display_name" \

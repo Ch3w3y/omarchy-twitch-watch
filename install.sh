@@ -28,6 +28,7 @@ if [[ ${#missing_pacman[@]} -gt 0 || ${#missing_aur[@]} -gt 0 ]]; then
 fi
 
 mkdir -p "$BIN_DIR" "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
 
 for script in twitch-auth twitch-followed-live twitch-watch; do
   cp "$SCRIPT_DIR/scripts/$script" "$BIN_DIR/$script"

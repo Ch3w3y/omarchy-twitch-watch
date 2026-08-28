@@ -9,8 +9,29 @@ SECRET_SERVICE="twitch-watch"
 SECRET_USERNAME="oauth-token"
 SCOPES="user:read:follows user:read:subscriptions"
 
+# Refuses a symlink, a file owned by someone else, or anything implausibly
+# large, before ever handing $CONFIG_FILE to jq.
+config_file_ok() {
+  [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || return 1
+  [[ "$(stat -c %u -- "$CONFIG_FILE" 2>/dev/null)" == "$(id -u)" ]] || return 1
+  local size
+  size="$(stat -c %s -- "$CONFIG_FILE" 2>/dev/null)" || return 1
+  (( size <= 65536 ))
+}
+
 client_id() {
-  jq -r '.client_id' "$CONFIG_FILE" 2>/dev/null
+  config_file_ok && jq -r '.client_id' "$CONFIG_FILE" 2>/dev/null
+}
+
+# Issues a curl request with the bearer token/client id fed through -K -
+# (stdin config) rather than an argv -H flag, so the token never appears in
+# `ps`/`/proc/<pid>/cmdline` for other local users to read.
+auth_curl() {
+  local token="$1" cid="$2"; shift 2
+  curl "$@" -K - <<EOF
+header = "Authorization: Bearer ${token}"
+header = "Client-Id: ${cid}"
+EOF
 }
 
 store_token() {
@@ -30,7 +51,7 @@ cmd_login() {
   fi
 
   local resp device_code user_code verification_uri interval expires_in
-  resp="$(curl -sf -X POST "https://id.twitch.tv/oauth2/device" \
+  resp="$(curl -sf --max-time 10 -X POST "https://id.twitch.tv/oauth2/device" \
     -d "client_id=$cid" \
     --data-urlencode "scopes=$SCOPES")"
   device_code="$(jq -r '.device_code' <<<"$resp")"
@@ -47,7 +68,7 @@ cmd_login() {
   while (( waited < expires_in )); do
     sleep "$interval"
     waited=$((waited + interval))
-    token_resp="$(curl -s -X POST "https://id.twitch.tv/oauth2/token" \
+    token_resp="$(curl -s --max-time 10 -X POST "https://id.twitch.tv/oauth2/token" \
       -d "client_id=$cid" \
       -d "device_code=$device_code" \
       -d "grant_type=urn:ietf:params:oauth:grant-type:device_code")"
@@ -73,9 +94,7 @@ cmd_login() {
   refresh_token="$(jq -r '.refresh_token' <<<"$token_resp")"
   expires_in2="$(jq -r '.expires_in' <<<"$token_resp")"
 
-  user_resp="$(curl -sf "https://api.twitch.tv/helix/users" \
-    -H "Authorization: Bearer $access_token" \
-    -H "Client-Id: $cid")"
+  user_resp="$(auth_curl "$access_token" "$cid" -sf --max-time 10 "https://api.twitch.tv/helix/users")"
   user_id="$(jq -r '.data[0].id' <<<"$user_resp")"
   login="$(jq -r '.data[0].login' <<<"$user_resp")"
 
@@ -104,10 +123,15 @@ cmd_token() {
   if [[ "$force" == "--force-refresh" ]] || (( now > obtained_at + expires_in - 300 )); then
     cid="$(client_id)"
     local resp new_access new_refresh new_exp
-    resp="$(curl -sf -X POST "https://id.twitch.tv/oauth2/token" \
-      -d "client_id=$cid" \
-      -d "refresh_token=$refresh_token" \
-      -d "grant_type=refresh_token")"
+    # refresh_token is a long-lived credential -- fed via -K - (stdin config)
+    # rather than -d argv, for the same process-inspection reason as the
+    # bearer token in auth_curl above.
+    resp="$(curl -sf --max-time 10 -X POST "https://id.twitch.tv/oauth2/token" -K - <<EOF
+data = "client_id=${cid}"
+data = "refresh_token=${refresh_token}"
+data = "grant_type=refresh_token"
+EOF
+)"
     new_access="$(jq -r '.access_token' <<<"$resp")"
     new_refresh="$(jq -r '.refresh_token' <<<"$resp")"
     new_exp="$(jq -r '.expires_in' <<<"$resp")"

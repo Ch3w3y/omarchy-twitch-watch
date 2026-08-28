@@ -19,10 +19,53 @@ STATE_DIR="$HOME/.local/state/twitch-watch"
 STATE_FILE="$STATE_DIR/session.json"
 CONFIG_FILE="$HOME/.config/twitch-watch/config.json"
 mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
 
-quality_setting="$(jq -r '.default_quality // "best"' "$CONFIG_FILE" 2>/dev/null || echo best)"
+# Refuses a symlink, a file owned by someone else, or anything implausibly
+# large, before ever handing $1 to jq.
+file_ok() {
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  [[ "$(stat -c %u -- "$1" 2>/dev/null)" == "$(id -u)" ]] || return 1
+  local size
+  size="$(stat -c %s -- "$1" 2>/dev/null)" || return 1
+  (( size <= 65536 ))
+}
+
+# Atomic, symlink-safe write: mktemp creates a fresh regular file in the same
+# directory (it never follows or reuses an existing symlink at that name),
+# and `mv` replaces the destination via rename(2), which swaps the directory
+# entry itself rather than writing through it -- so a pre-planted symlink at
+# $STATE_FILE can't redirect the write elsewhere.
+write_state() {
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/.session.json.XXXXXX")"
+  cat > "$tmp"
+  mv -f "$tmp" "$STATE_FILE"
+}
+
+# Twitch login grammar: 4-25 letters/digits/underscore. Validated once here
+# and enforced before $channel is ever used in a filename, a streamlink URL,
+# or (via $STATE_FILE, itself only ever written after this check) the
+# pkill/pgrep pattern in hot_swap -- so it can never carry a shell or regex
+# metacharacter into any of those.
+validate_channel() {
+  [[ "$1" =~ ^[A-Za-z0-9_]{4,25}$ ]]
+}
+
+quality_setting="best"
+if file_ok "$CONFIG_FILE"; then
+  quality_setting="$(jq -r '.default_quality // "best"' "$CONFIG_FILE" 2>/dev/null || echo best)"
+fi
+# Allowlist matching SettingsView.qml's quality buttons exactly. A hand-edited
+# config.json can't otherwise inject extra streamlink args here: an
+# unvalidated value with spaces would word-split when expanded unquoted below.
 quality="best"
-[[ "$quality_setting" != "best" && -n "$quality_setting" ]] && quality="$quality_setting,best"
+if [[ "$quality_setting" != "best" ]]; then
+  case "$quality_setting" in
+    1080p60|720p60|480p) quality="$quality_setting,best" ;;
+    *) echo "twitch-watch: ignoring invalid default_quality \"$quality_setting\" in config, using \"best\"." >&2 ;;
+  esac
+fi
 
 pick_channel() {
   local live_lines result
@@ -53,7 +96,7 @@ pick_channel() {
 }
 
 session_is_live() {
-  [[ -f "$STATE_FILE" ]] || return 1
+  file_ok "$STATE_FILE" || return 1
   [[ -S "$SOCK" ]] || return 1
   echo '{"command":["get_property","pid"]}' | timeout 1 socat - "UNIX-CONNECT:$SOCK" >/dev/null 2>&1
 }
@@ -64,9 +107,13 @@ session_is_live() {
 # start/swap" reset; manual dragging afterward still works either way.
 apply_locked_width() {
   local locked chat_width win_json cur_w delta
-  locked="$(jq -r '.locked // true' "$CONFIG_FILE" 2>/dev/null || echo true)"
+  locked="true"
+  chat_width="420"
+  if file_ok "$CONFIG_FILE"; then
+    locked="$(jq -r '.locked // true' "$CONFIG_FILE" 2>/dev/null || echo true)"
+    chat_width="$(jq -r '.chat_width // 420' "$CONFIG_FILE" 2>/dev/null || echo 420)"
+  fi
   [[ "$locked" == "true" ]] || return 0
-  chat_width="$(jq -r '.chat_width // 420' "$CONFIG_FILE" 2>/dev/null || echo 420)"
 
   for _ in $(seq 1 30); do
     win_json="$(hyprctl clients -j | jq -c '[.[] | select(.title=="Chatuino")][0] // empty' 2>/dev/null)"
@@ -133,26 +180,27 @@ fresh_launch() {
   rm -f "$SOCK"
   streamlink --player mpv --title "Twitch - $ch" \
     --player-args "--input-ipc-server=$SOCK" \
-    "twitch.tv/$ch" $quality &
+    "twitch.tv/$ch" "$quality" &
   slpid=$!
   # Orientation must be corrected before the width lock runs -- that resize
   # math is calibrated for a right-side chatuino.
   ( apply_orientation; apply_locked_width ) &
   ( apply_tiled_mpv & )
   jq -n --arg ch "$ch" --arg sock "$SOCK" --arg id "chatuino-$ch" --argjson pid "$slpid" \
-    '{channel:$ch, mpv_ipc_socket:$sock, chatuino_app_id:$id, streamlink_pid:$pid}' > "$STATE_FILE"
+    '{channel:$ch, mpv_ipc_socket:$sock, chatuino_app_id:$id, streamlink_pid:$pid}' | write_state
   exec omarchy-launch-tui --app-id="chatuino-$ch" chatuino --tab "$ch"
 }
 
 hot_swap() {
   local new="$1" old url old_pattern slpid
 
+  file_ok "$STATE_FILE" || { echo "twitch-watch: $STATE_FILE missing or untrustworthy" >&2; exit 1; }
   old="$(jq -r '.channel' "$STATE_FILE")"
   if [[ "$new" == "$old" ]]; then
     exit 0
   fi
 
-  url="$(streamlink --stream-url "twitch.tv/$new" $quality)" || {
+  url="$(streamlink --stream-url "twitch.tv/$new" "$quality")" || {
     command -v notify-send >/dev/null 2>&1 && notify-send "Twitch" "Couldn't resolve $new"
     exit 1
   }
@@ -163,6 +211,9 @@ hot_swap() {
   # Ghostty (--gtk-single-instance=true) rejects the --class override Omarchy
   # sends it, so every chatuino window carries the same generic class -- wait
   # on the process actually exiting instead of a window-class check.
+  # $old came from $STATE_FILE, which is only ever written below (and in
+  # fresh_launch) with a channel that already passed validate_channel, so it
+  # can't carry a pkill/pgrep regex metacharacter here.
   old_pattern="chatuino --tab ${old}\$"
   pkill -f -- "$old_pattern" || true
   for _ in $(seq 1 20); do
@@ -180,13 +231,19 @@ hot_swap() {
   slpid="$(jq -r '.streamlink_pid // empty' "$STATE_FILE")"
 
   jq -n --arg ch "$new" --arg sock "$SOCK" --arg id "chatuino-$new" --argjson pid "${slpid:-null}" \
-    '{channel:$ch, mpv_ipc_socket:$sock, chatuino_app_id:$id, streamlink_pid:$pid}' > "$STATE_FILE"
+    '{channel:$ch, mpv_ipc_socket:$sock, chatuino_app_id:$id, streamlink_pid:$pid}' | write_state
 }
 
 channel="${1:-}"
 if [[ -z "$channel" ]]; then
   channel="$(pick_channel)"
   [[ -z "$channel" ]] && exit 0
+fi
+
+if ! validate_channel "$channel"; then
+  echo "twitch-watch: \"$channel\" isn't a valid Twitch login (4-25 letters/digits/underscore)." >&2
+  command -v notify-send >/dev/null 2>&1 && notify-send "Twitch" "\"$channel\" isn't a valid Twitch channel name"
+  exit 1
 fi
 
 if session_is_live; then

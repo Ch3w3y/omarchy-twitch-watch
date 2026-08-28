@@ -158,6 +158,10 @@ Item {
             spacing: 2
 
             Text {
+              // login/display_name/game_name ultimately come from Twitch API
+              // responses -- pin PlainText so none of it is ever interpreted
+              // as rich text (AutoText's default behavior).
+              textFormat: Text.PlainText
               text: rowDelegate.modelData.isFreeText
                 ? ("⌨  Watch “" + rowDelegate.modelData.login + "”")
                 : ((rowDelegate.modelData.is_subscribed ? "🟣 " : "🔴 ") + rowDelegate.modelData.login)
@@ -171,6 +175,7 @@ Item {
 
             Text {
               visible: !rowDelegate.modelData.isFreeText
+              textFormat: Text.PlainText
               text: rowDelegate.modelData.display_name + " · " + rowDelegate.modelData.viewer_count +
                     " viewers · " + rowDelegate.modelData.game_name
               color: Qt.alpha(root.foreground, 0.65)
