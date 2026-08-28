@@ -1,12 +1,31 @@
 #!/bin/bash
 # Installs the twitch-watch companion scripts to ~/.local/bin and scaffolds
 # ~/.config/twitch-watch/config.json. Does not touch pacman/AUR, does not use
-# sudo/pkexec, and does not modify any file outside $HOME.
+# sudo/pkexec, and does not modify any file outside $HOME. Checks for missing
+# system dependencies and prints (never runs) the command to install them --
+# you stay in control of anything that needs a password.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 CONFIG_DIR="$HOME/.config/twitch-watch"
+
+missing_pacman=()
+missing_aur=()
+command -v streamlink >/dev/null 2>&1 || missing_pacman+=(streamlink)
+command -v mpv >/dev/null 2>&1 || missing_pacman+=(mpv)
+command -v socat >/dev/null 2>&1 || missing_pacman+=(socat)
+command -v jq >/dev/null 2>&1 || missing_pacman+=(jq)
+command -v curl >/dev/null 2>&1 || missing_pacman+=(curl)
+command -v secret-tool >/dev/null 2>&1 || missing_pacman+=(libsecret)
+command -v chatuino >/dev/null 2>&1 || missing_aur+=(chatuino-bin)
+
+if [[ ${#missing_pacman[@]} -gt 0 || ${#missing_aur[@]} -gt 0 ]]; then
+  echo "Missing dependencies detected. Run these yourself before continuing:"
+  [[ ${#missing_pacman[@]} -gt 0 ]] && echo "  sudo pacman -S --needed ${missing_pacman[*]}"
+  [[ ${#missing_aur[@]} -gt 0 ]] && echo "  yay -S ${missing_aur[*]}   # or your preferred AUR helper"
+  echo
+fi
 
 mkdir -p "$BIN_DIR" "$CONFIG_DIR"
 

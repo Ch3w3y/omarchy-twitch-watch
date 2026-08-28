@@ -37,14 +37,10 @@ the script, no extra setup needed for those.
 
 ## Prerequisites
 
-Install with your package manager (`pacman`/AUR on Omarchy):
-
-- `streamlink`
-- `mpv`
+- `streamlink`, `mpv`, `socat`, `jq`, `curl`, `libsecret` (`pacman`)
 - [`chatuino`](https://aur.archlinux.org/packages/chatuino-bin) (AUR) —
   logged in separately via `chatuino account` (its own Twitch login, unrelated
   to this plugin's)
-- `socat`, `jq`, `curl` — present on a stock Omarchy install
 
 You'll also register your own (free) Twitch application for this plugin's API
 access — see Setup below. It never uses Chatuino's own login/token.
@@ -62,6 +58,10 @@ Then run the bundled installer, which copies the companion scripts to
 ```bash
 ~/.config/omarchy/plugins/io.github.ch3w3y.twitch-watch/install.sh
 ```
+
+It checks for the dependencies above and, if anything's missing, prints the
+exact `pacman`/AUR command to install them — it never runs one itself, so
+you're always the one entering your password.
 
 ## Setup
 
