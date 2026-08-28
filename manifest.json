@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ch3w3y.twitch-watch",
+  "name": "Twitch Watch",
+  "version": "1.0.0",
+  "author": "Ch3w3y",
+  "license": "MIT",
+  "description": "Live followed-channel picker for Twitch: bar pill with a live indicator, a rich thumbnail picker with search, and one click to launch or hot-swap an mpv + chatuino watch session.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Twitch Watch",
+    "description": "Live followed Twitch channels with thumbnails, viewer counts, and search. Pick one to launch or hot-swap an mpv + chatuino watch session.",
+    "category": "Widgets",
+    "aliases": ["twitch", "streaming", "chatuino"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

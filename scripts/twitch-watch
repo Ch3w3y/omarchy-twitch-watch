@@ -1,0 +1,196 @@
+#!/bin/bash
+# Open a Twitch stream (streamlink -> mpv) and its chat (chatuino) side by
+# side, or hot-swap an already-running pair to a new channel in place.
+# With no argument, opens a picker prepopulated with live followed channels
+# (sub > viewers > followed time), with search and free-text fallback.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+  echo "twitch-watch: \$XDG_RUNTIME_DIR is not set (expected on any systemd" \
+       "user session). Refusing to fall back to a shared /tmp path for the" \
+       "mpv IPC socket." >&2
+  exit 1
+fi
+
+SOCK="$XDG_RUNTIME_DIR/twitch-watch-mpv.sock"
+STATE_DIR="$HOME/.local/state/twitch-watch"
+STATE_FILE="$STATE_DIR/session.json"
+CONFIG_FILE="$HOME/.config/twitch-watch/config.json"
+mkdir -p "$STATE_DIR"
+
+quality_setting="$(jq -r '.default_quality // "best"' "$CONFIG_FILE" 2>/dev/null || echo best)"
+quality="best"
+[[ "$quality_setting" != "best" && -n "$quality_setting" ]] && quality="$quality_setting,best"
+
+pick_channel() {
+  local live_lines result
+
+  live_lines="$("$SCRIPT_DIR/twitch-followed-live" --menu-lines 2>/dev/null)" || live_lines=""
+
+  if [[ -z "$live_lines" ]]; then
+    result="$(omarchy-menu-input "Twitch channel")" || result=""
+    printf '%s' "$result"
+    return
+  fi
+
+  local sentinel picked
+  sentinel=$'⌨️\tType a channel…\tEnter any Twitch login manually'
+  picked="$(printf '%s\n%s\n' "$live_lines" "$sentinel" | omarchy-menu-select "Twitch channel")" || picked=""
+
+  if [[ -z "$picked" ]]; then
+    printf ''
+    return
+  fi
+
+  if [[ "$picked" == *"Type a channel…"* ]]; then
+    result="$(omarchy-menu-input "Twitch channel")" || result=""
+    printf '%s' "$result"
+  else
+    printf '%s' "${picked%%$'\t'*}"
+  fi
+}
+
+session_is_live() {
+  [[ -f "$STATE_FILE" ]] || return 1
+  [[ -S "$SOCK" ]] || return 1
+  echo '{"command":["get_property","pid"]}' | timeout 1 socat - "UNIX-CONNECT:$SOCK" >/dev/null 2>&1
+}
+
+# Resets the chatuino window to the configured fixed width, if locked. Not a
+# hard constraint (Hyprland has no runtime toggle for min/max_size enforcement,
+# only static window rules) -- just a "known-good default on every session
+# start/swap" reset; manual dragging afterward still works either way.
+apply_locked_width() {
+  local locked chat_width win_json cur_w delta
+  locked="$(jq -r '.locked // true' "$CONFIG_FILE" 2>/dev/null || echo true)"
+  [[ "$locked" == "true" ]] || return 0
+  chat_width="$(jq -r '.chat_width // 420' "$CONFIG_FILE" 2>/dev/null || echo 420)"
+
+  for _ in $(seq 1 30); do
+    win_json="$(hyprctl clients -j | jq -c '[.[] | select(.title=="Chatuino")][0] // empty' 2>/dev/null)"
+    [[ -n "$win_json" ]] && break
+    sleep 0.1
+  done
+  [[ -n "$win_json" ]] || return 0
+
+  # Hyprland's tiled resize dispatcher is delta-based even in "absolute" mode,
+  # and the sign is inverted for a window on the right side of a split
+  # (confirmed empirically): a positive delta SHRINKS it, negative GROWS it.
+  # So the delta that lands on an exact target width is (current - target).
+  cur_w="$(jq -r '.size[0]' <<<"$win_json")"
+  delta=$((cur_w - chat_width))
+  [[ "$delta" -eq 0 ]] && return 0
+  hyprctl dispatch "hl.dsp.window.resize({ x=$delta, y=0, relative=true, window=\"title:^(Chatuino)\$\" })" >/dev/null 2>&1
+}
+
+# mpv floats intermittently: shortly after a stream loads, it auto-resizes to
+# the video's native aspect ratio, and Hyprland sometimes treats that
+# follow-up size request as a "wants a fixed size" hint and floats it -- a
+# static `float = false` window rule doesn't prevent this since it's a
+# post-map behavior. Poll for a few seconds and force it back to tiled
+# whenever the race happens.
+apply_tiled_mpv() {
+  local i floating
+  for i in $(seq 1 20); do
+    floating="$(hyprctl clients -j | jq -r '[.[] | select(.class=="mpv")][0].floating // empty' 2>/dev/null)"
+    if [[ "$floating" == "true" ]]; then
+      hyprctl dispatch 'hl.dsp.window.float({ action = "off", window = "class:^(mpv)$" })' >/dev/null 2>&1
+    fi
+    sleep 0.3
+  done
+}
+
+# dwindle's insertion side for a freshly-opened window isn't reliably
+# steerable from a script -- `preselect <dir>` was tried and empirically
+# moved the wrong window regardless of direction (likely a focus-timing
+# issue through the multi-step terminal-launch chain). Deterministic
+# alternative: wait for both windows, check their actual X position, and
+# swap if chatuino landed left of mpv. `hl.dsp.window.swap` has no `window`
+# target param -- it operates on the currently ACTIVE window, which is
+# chatuino here since it's the one just launched and terminal emulators grab
+# focus on open.
+apply_orientation() {
+  local mpv_json chat_json mpv_x chat_x
+  for _ in $(seq 1 30); do
+    mpv_json="$(hyprctl clients -j | jq -c '[.[] | select(.class=="mpv")][0] // empty' 2>/dev/null)"
+    chat_json="$(hyprctl clients -j | jq -c '[.[] | select(.title=="Chatuino")][0] // empty' 2>/dev/null)"
+    [[ -n "$mpv_json" && -n "$chat_json" ]] && break
+    sleep 0.2
+  done
+  [[ -n "$mpv_json" && -n "$chat_json" ]] || return 0
+
+  mpv_x="$(jq -r '.at[0]' <<<"$mpv_json")"
+  chat_x="$(jq -r '.at[0]' <<<"$chat_json")"
+  if [[ "$chat_x" -lt "$mpv_x" ]]; then
+    hyprctl dispatch 'hl.dsp.window.swap({ direction = "r" })' >/dev/null 2>&1
+  fi
+}
+
+fresh_launch() {
+  local ch="$1" slpid
+  rm -f "$SOCK"
+  streamlink --player mpv --title "Twitch - $ch" \
+    --player-args "--input-ipc-server=$SOCK" \
+    "twitch.tv/$ch" $quality &
+  slpid=$!
+  # Orientation must be corrected before the width lock runs -- that resize
+  # math is calibrated for a right-side chatuino.
+  ( apply_orientation; apply_locked_width ) &
+  ( apply_tiled_mpv & )
+  jq -n --arg ch "$ch" --arg sock "$SOCK" --arg id "chatuino-$ch" --argjson pid "$slpid" \
+    '{channel:$ch, mpv_ipc_socket:$sock, chatuino_app_id:$id, streamlink_pid:$pid}' > "$STATE_FILE"
+  exec omarchy-launch-tui --app-id="chatuino-$ch" chatuino --tab "$ch"
+}
+
+hot_swap() {
+  local new="$1" old url old_pattern slpid
+
+  old="$(jq -r '.channel' "$STATE_FILE")"
+  if [[ "$new" == "$old" ]]; then
+    exit 0
+  fi
+
+  url="$(streamlink --stream-url "twitch.tv/$new" $quality)" || {
+    command -v notify-send >/dev/null 2>&1 && notify-send "Twitch" "Couldn't resolve $new"
+    exit 1
+  }
+
+  jq -cn --arg u "$url" '{command:["loadfile",$u,"replace"]}' | socat - "UNIX-CONNECT:$SOCK"
+  jq -cn --arg t "Twitch - $new" '{command:["set_property","title",$t]}' | socat - "UNIX-CONNECT:$SOCK"
+
+  # Ghostty (--gtk-single-instance=true) rejects the --class override Omarchy
+  # sends it, so every chatuino window carries the same generic class -- wait
+  # on the process actually exiting instead of a window-class check.
+  old_pattern="chatuino --tab ${old}\$"
+  pkill -f -- "$old_pattern" || true
+  for _ in $(seq 1 20); do
+    pgrep -f -- "$old_pattern" >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  setsid omarchy-launch-tui --app-id="chatuino-$new" chatuino --tab "$new" >/dev/null 2>&1 &
+  apply_locked_width &
+  apply_tiled_mpv &
+
+  # The original `streamlink --player mpv ...` process from fresh_launch is
+  # mpv's actual process supervisor, not a disposable resolver -- it must
+  # keep running untouched, or mpv (which we just hot-swapped in place) dies
+  # with it. Only its PID carries forward into the new state.
+  slpid="$(jq -r '.streamlink_pid // empty' "$STATE_FILE")"
+
+  jq -n --arg ch "$new" --arg sock "$SOCK" --arg id "chatuino-$new" --argjson pid "${slpid:-null}" \
+    '{channel:$ch, mpv_ipc_socket:$sock, chatuino_app_id:$id, streamlink_pid:$pid}' > "$STATE_FILE"
+}
+
+channel="${1:-}"
+if [[ -z "$channel" ]]; then
+  channel="$(pick_channel)"
+  [[ -z "$channel" ]] && exit 0
+fi
+
+if session_is_live; then
+  hot_swap "$channel"
+else
+  fresh_launch "$channel"
+fi

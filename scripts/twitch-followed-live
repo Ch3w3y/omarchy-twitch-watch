@@ -1,0 +1,165 @@
+#!/bin/bash
+# Fetch the caller's currently-LIVE followed Twitch channels, sorted by
+# subscribed > viewer count > followed time (most recent first).
+#
+# Usage:
+#   twitch-followed-live               # JSON array to stdout
+#   twitch-followed-live --menu-lines  # omarchy-menu-select formatted lines
+set -euo pipefail
+
+CONFIG_FILE="$HOME/.config/twitch-watch/config.json"
+API="https://api.twitch.tv/helix"
+
+client_id() {
+  jq -r '.client_id' "$CONFIG_FILE"
+}
+
+# GET $1 (path+query), returns body on stdout, retries once on 401.
+api_get() {
+  local path="$1" cid token raw status body
+  cid="$(client_id)"
+  token="$(twitch-auth token)"
+  raw="$(curl -s -w $'\n%{http_code}' "$API$path" -H "Authorization: Bearer $token" -H "Client-Id: $cid")"
+  status="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+  if [[ "$status" == "401" ]]; then
+    token="$(twitch-auth token --force-refresh)"
+    raw="$(curl -s -w $'\n%{http_code}' "$API$path" -H "Authorization: Bearer $token" -H "Client-Id: $cid")"
+    status="${raw##*$'\n'}"
+    body="${raw%$'\n'*}"
+  fi
+  if [[ "$status" != 2* ]]; then
+    echo "twitch-followed-live: $path failed ($status)" >&2
+    return 1
+  fi
+  echo "$body"
+}
+
+# Prints "true"/"false" for whether $user_id subscribes to $broadcaster_id.
+check_sub() {
+  local broadcaster_id="$1" user_id="$2" cid token status
+  cid="$(client_id)"
+  token="$(twitch-auth token)"
+  status="$(curl -s -o /dev/null -w '%{http_code}' \
+    "$API/subscriptions/user?broadcaster_id=$broadcaster_id&user_id=$user_id" \
+    -H "Authorization: Bearer $token" -H "Client-Id: $cid")"
+  if [[ "$status" == "401" ]]; then
+    token="$(twitch-auth token --force-refresh)"
+    status="$(curl -s -o /dev/null -w '%{http_code}' \
+      "$API/subscriptions/user?broadcaster_id=$broadcaster_id&user_id=$user_id" \
+      -H "Authorization: Bearer $token" -H "Client-Id: $cid")"
+  fi
+  [[ "$status" == "200" ]] && echo true || echo false
+}
+
+humanize_ago() {
+  local ts="$1" now epoch diff
+  now="$(date +%s)"
+  epoch="$(date -d "$ts" +%s 2>/dev/null || echo "$now")"
+  diff=$((now - epoch))
+  if (( diff < 3600 )); then
+    echo "$((diff / 60))m ago"
+  elif (( diff < 86400 )); then
+    echo "$((diff / 3600))h ago"
+  elif (( diff < 2592000 )); then
+    echo "$((diff / 86400))d ago"
+  elif (( diff < 31536000 )); then
+    echo "$((diff / 2592000))mo ago"
+  else
+    echo "$((diff / 31536000))y ago"
+  fi
+}
+
+menu_lines="false"
+[[ "${1:-}" == "--menu-lines" ]] && menu_lines="true"
+
+user_id="$(twitch-auth whoami | jq -r '.user_id')"
+
+# 1. All followed channels, paginated.
+followed_json="[]"
+cursor=""
+while :; do
+  q="/channels/followed?user_id=$user_id&first=100"
+  [[ -n "$cursor" ]] && q="$q&after=$cursor"
+  resp="$(api_get "$q")"
+  page="$(jq -c '.data' <<<"$resp")"
+  followed_json="$(jq -c -n --argjson a "$followed_json" --argjson b "$page" '$a + $b')"
+  cursor="$(jq -r '.pagination.cursor // empty' <<<"$resp")"
+  [[ -z "$cursor" ]] && break
+done
+
+if [[ "$(jq 'length' <<<"$followed_json")" -eq 0 ]]; then
+  echo "[]"
+  exit 0
+fi
+
+# 2. Which of those are live right now, in chunks of 100 broadcaster ids.
+mapfile -t ids < <(jq -r '.[].broadcaster_id' <<<"$followed_json")
+live_json="[]"
+chunk=()
+for id in "${ids[@]}" ""; do
+  [[ -n "$id" ]] && chunk+=("$id")
+  if [[ ${#chunk[@]} -eq 100 || ( -z "$id" && ${#chunk[@]} -gt 0 ) ]]; then
+    qs=""
+    for bid in "${chunk[@]}"; do qs+="user_id=$bid&"; done
+    resp="$(api_get "/streams?${qs%&}")"
+    page="$(jq -c '.data' <<<"$resp")"
+    live_json="$(jq -c -n --argjson a "$live_json" --argjson b "$page" '$a + $b')"
+    chunk=()
+  fi
+done
+
+if [[ "$(jq 'length' <<<"$live_json")" -eq 0 ]]; then
+  echo "[]"
+  exit 0
+fi
+
+# 3. Merge with followed_at, check sub status per live channel only.
+result="[]"
+while IFS= read -r stream; do
+  bid="$(jq -r '.user_id' <<<"$stream")"
+  login="$(jq -r '.user_login' <<<"$stream")"
+  display_name="$(jq -r '.user_name' <<<"$stream")"
+  viewer_count="$(jq -r '.viewer_count' <<<"$stream")"
+  game_name="$(jq -r '.game_name' <<<"$stream")"
+  title="$(jq -r '.title' <<<"$stream")"
+  followed_at="$(jq -r --arg id "$bid" '.[] | select(.broadcaster_id==$id) | .followed_at' <<<"$followed_json")"
+  is_sub="$(check_sub "$bid" "$user_id")"
+  thumbnail_url="$(jq -r '.thumbnail_url' <<<"$stream")"
+  thumbnail_url="${thumbnail_url/\{width\}x\{height\}/220x124}"
+
+  entry="$(jq -c -n \
+    --arg login "$login" --arg display_name "$display_name" \
+    --argjson viewer_count "$viewer_count" --arg game_name "$game_name" \
+    --arg title "$title" --arg followed_at "$followed_at" --argjson is_subscribed "$is_sub" \
+    --arg thumbnail_url "$thumbnail_url" \
+    '{login:$login, display_name:$display_name, viewer_count:$viewer_count,
+      game_name:$game_name, title:$title, followed_at:$followed_at, is_subscribed:$is_subscribed,
+      thumbnail_url:$thumbnail_url}')"
+  result="$(jq -c -n --argjson a "$result" --argjson e "$entry" '$a + [$e]')"
+done < <(jq -c '.[]' <<<"$live_json")
+
+sorted="$(jq -c \
+  'sort_by([(if .is_subscribed then 0 else 1 end), -.viewer_count, -(.followed_at | fromdate)])' \
+  <<<"$result")"
+
+if [[ "$menu_lines" == "false" ]]; then
+  jq '.' <<<"$sorted"
+  exit 0
+fi
+
+while IFS= read -r entry; do
+  login="$(jq -r '.login' <<<"$entry")"
+  display_name="$(jq -r '.display_name' <<<"$entry")"
+  viewer_count="$(jq -r '.viewer_count' <<<"$entry")"
+  game_name="$(jq -r '.game_name' <<<"$entry")"
+  followed_at="$(jq -r '.followed_at' <<<"$entry")"
+  is_sub="$(jq -r '.is_subscribed' <<<"$entry")"
+
+  glyph="🔴"
+  [[ "$is_sub" == "true" ]] && glyph="🟣"
+
+  ago="$(humanize_ago "$followed_at")"
+  subtext="$display_name · ${viewer_count} viewers · ${game_name:-?} · followed $ago"
+  printf '%s\t%s\t%s\n' "$glyph" "$login" "$subtext"
+done < <(jq -c '.[]' <<<"$sorted")
