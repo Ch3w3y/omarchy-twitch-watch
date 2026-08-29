@@ -74,10 +74,17 @@ Panel {
         try { root.channels = JSON.parse(text) } catch (e) { /* keep stale list */ }
       }
     }
+    // The script writes its diagnostics to stderr; without this every auth and
+    // API failure is invisible and the sweep just silently retries forever.
+    stderr: StdioCollector {
+      onStreamFinished: if (text && text.trim() !== "") console.warn("twitch-watch:", text.trim())
+    }
   }
 
   Timer {
-    interval: Math.max(15, root.refreshIntervalSec) * 1000
+    // This lives in the bar widget, so it runs once per monitor. While the popup
+    // is shut the bar only needs a live-channel count, so back right off.
+    interval: Math.max(15, root.refreshIntervalSec) * 1000 * (root.opened ? 1 : 5)
     running: true
     repeat: true
     triggeredOnStart: true
